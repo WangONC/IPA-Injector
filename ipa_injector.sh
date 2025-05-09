@@ -8,6 +8,7 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 
 SIGN_ONLY=0
+USE_FRIDA=0
 
 die() {
     echo -e "${RED}[ERROR] $1${NC}" >&2
