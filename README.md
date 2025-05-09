@@ -10,14 +10,13 @@ IPA-Injector是一个macOS下的全自动的IPA动态库注入shell脚本，支�
 
 ### 必需依赖
 
-- `unzip`：用于解压 IPA 文件，一般macOS自带，无需手动安装。
-- `zip`：用于重新打包 IPA 文件，一般macOS自带，无需手动安装。
 - `codesign`：用于代码签名，通常包含在 Xcode 命令行工具中。
 - `security`：用于处理证书和描述文件，一般macOS自带，无需手动安装。
 - `plutil`：用于处理 `.plist` 文件，一般macOS自带，无需手动安装。
 - `pymobiledevice3`：用于与 iOS 设备交互，安装 IPA 文件，启动debugserver等。
 - `insert_dylib`：用于将动态库注入到二进制文件中。
 - `applesign`：node工具，用于重签名 IPA 文件（所以还需要node）。
+- `ditto`：用于压缩和解压缩ipa，一般macOS自带，无需手动安装。
 
 ### 可选依赖
 
@@ -28,9 +27,6 @@ IPA-Injector是一个macOS下的全自动的IPA动态库注入shell脚本，支�
 ```bash
 # 安装 Xcode 命令行工具
 xcode-select --install
-
-# 安装 unzip 和 zip，一般来说系统会有
-brew install unzip zip
 
 # 安装 pymobiledevice3
 python3 -m pip install -U pymobiledevice3
@@ -60,9 +56,9 @@ brew install openssl
 对于动态库，如果是frida的gadget，建议命名为`FridaGadget.dylib`。
 
 ```bash
-./ipa_injector.sh <ipa文件> [描述文件]
+./ipa_injector.sh [--sign-only] <ipa文件> [描述文件]
 ```
-
+- `[--sign-only]`: 可选，如果加入则跳过所有注入流程，本质上将相当于是变成了一个一键签名安装的工具
 - `<ipa文件>`：需要注入的 IPA 文件路径。
 - `[描述文件]`：可选（但必须要有），用于重签名的描述文件，默认为 `embedded.mobileprovision`。
 
@@ -74,6 +70,11 @@ brew install openssl
 
 # 使用自定义描述文件
 ./ipa_injector.sh WeChat.ipa profile.mobileprovision
+
+# 仅签名安装
+./ipa_injector.sh --sign-only WeChat.ipa
+# 或者
+./ipa_injector.sh -s WeChat.ipa
 ```
 
 ### frida
@@ -105,5 +106,5 @@ brew install openssl
 ## 注意事项
 
 1. 确保设备已连接并信任当前电脑。
-2. 脚本会首先要求选择签名证书，所以确保在钥匙串中已经导入了需要的证书（应当使用dev证书）。
+2. 脚本会首先要求选择签名证书，所以确保在钥匙串中已经导入了需要的证书（如果需要调试应当使用dev证书，而不是分发证书）。
 3. 通过lldb来启动应用时，需要根据最后的提示手动执行两条命令，尝试通过脚本执行会阻塞，原因未知。
