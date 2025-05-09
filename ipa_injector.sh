@@ -7,6 +7,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
+SIGN_ONLY=0
+
 die() {
     echo -e "${RED}[ERROR] $1${NC}" >&2
     exit 1
@@ -17,14 +19,13 @@ warn() {
 }
 
 check_deps() {
-    command -v unzip >/dev/null || die "Missing unzip, try: brew install unzip"
-    command -v zip >/dev/null || die "Missing zip, try: brew install zip"
     command -v codesign >/dev/null || die "Missing Xcode command line tools, try: xcode-select --install"
     command -v security >/dev/null || die "Missing security command, your device may be incomplete"
     command -v plutil >/dev/null || die "Missing plutil command, your device may be incomplete"
     command -v pymobiledevice3 >/dev/null || die "pymobiledevice3 not installed, try: python3 -m pip install -U pymobiledevice3"
     command -v insert_dylib >/dev/null || die "insert_dylib not installed, try: git clone https://github.com/Tyilo/insert_dylib && cd insert_dylib && xcodebuild && cp build/Release/insert_dylib /usr/local/bin/insert_dylib"
     command -v applesign >/dev/null || die "applesign not installed, try: brew install node && npm install -g applesign"
+    command -v ditto >/dev/null || die "Missing ditto, which is usually included with macOS"
     
     if ! command -v openssl >/dev/null; then
         echo -e "${YELLOW}Warning: Missing openssl, will use random strings as fallback. Suggested install: brew install openssl${NC}"
@@ -158,15 +159,19 @@ install_ipa() {
 show_usage() {
     cat <<EOF
 Usage:
-    $(basename "$0") <ipa_file> [provision_file]
+    $(basename "$0") [options] <ipa_file> [provision_file]
 
 Parameters:
     ipa_file      - Required, path to the IPA file to be injected
     provision_file - Optional, provision file for re-signing, defaults to embedded.mobileprovision
 
+Options:
+    -s, --sign-only    Only sign and install the IPA without injecting dylibs
+
 Examples:
     $(basename "$0") WeChat.ipa
     $(basename "$0") WeChat.ipa profile.mobileprovision
+    $(basename "$0") --sign-only WeChat.ipa profile.mobileprovision
 EOF
     exit 1
 }
@@ -190,6 +195,20 @@ sign_dylibs() {
 
 [ $# -eq 0 ] && show_usage
 
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -s|--sign-only)
+            SIGN_ONLY=1
+            echo -e "${GREEN}Running in sign-only mode (no dylib injection)${NC}"
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+[ $# -eq 0 ] && show_usage
 
 # Prepare working directory
 WORK_DIR="work"
@@ -207,12 +226,14 @@ check_deps
 [ -f "$INPUT_IPA" ] || die "Specified IPA file does not exist"
 [ -f "$PROVISION" ] || die "Specified provision file does not exist"
 
-# Check for dylibs and frameworks in the current directory
-DYLIBS=($(find . -maxdepth 1 -name "*.dylib" -type f 2>/dev/null))
-FRAMEWORKS=($(find . -maxdepth 1 -name "*.framework" -type d 2>/dev/null))
+if [ $SIGN_ONLY -eq 0 ]; then
+    # Check for dylibs and frameworks in the current directory
+    DYLIBS=($(find . -maxdepth 1 -name "*.dylib" -type f 2>/dev/null))
+    FRAMEWORKS=($(find . -maxdepth 1 -name "*.framework" -type d 2>/dev/null))
 
-if [ ${#DYLIBS[@]} -eq 0 ] && [ ${#FRAMEWORKS[@]} -eq 0 ]; then
-    die "Error: No dylib files or frameworks found in the current directory"
+    if [ ${#DYLIBS[@]} -eq 0 ] && [ ${#FRAMEWORKS[@]} -eq 0 ]; then
+        die "Error: No dylib files or frameworks found in the current directory"
+    fi
 fi
 
 # Select signing certificate
@@ -221,7 +242,8 @@ select_identity
 
 # Unpack IPA
 echo -e "${GREEN}Unpacking IPA...${NC}"
-unzip -q "$INPUT_IPA" -d "$WORK_DIR"
+# 使用ditto替换unzip以更好地支持中文文件名
+ditto -x -k "$INPUT_IPA" "$WORK_DIR" || die "Failed to extract IPA"
 APP_DIR=$(find "$WORK_DIR" -name "*.app" -type d | head -n1)
 [ -d "$APP_DIR" ] || die "Could not find .app directory"
 
@@ -231,71 +253,76 @@ extract_bundle_id "$PROVISION"
 
 INJECTED_DYLIBS=()
 
-for dylib in "${DYLIBS[@]}"; do
+if [ $SIGN_ONLY -eq 0 ]; then
+    for dylib in "${DYLIBS[@]}"; do
 
-    # Inject dylib
-    DYLIB_NAME="lib$(if [ $USE_OPENSSL -eq 1 ]; then openssl rand -hex 6; else head /dev/urandom | tr -dc 'a-f0-9' | head -c 12; fi).dylib"
-    mkdir -p "$APP_DIR/Frameworks"
-    cp "$dylib" "$APP_DIR/Frameworks/$DYLIB_NAME"
-    install_name_tool -id "@executable_path/Frameworks/$DYLIB_NAME" "$APP_DIR/Frameworks/$DYLIB_NAME"
+        # Inject dylib
+        DYLIB_NAME="lib$(if [ $USE_OPENSSL -eq 1 ]; then openssl rand -hex 6; else head /dev/urandom | tr -dc 'a-f0-9' | head -c 12; fi).dylib"
+        mkdir -p "$APP_DIR/Frameworks"
+        cp "$dylib" "$APP_DIR/Frameworks/$DYLIB_NAME"
+        install_name_tool -id "@executable_path/Frameworks/$DYLIB_NAME" "$APP_DIR/Frameworks/$DYLIB_NAME"
 
-    # Generate config for Frida Gadget
-    if [[ "$dylib" == *FridaGadget.dylib ]]; then
-        USE_FRIDA=1
-        generate_gadget_config "$DYLIB_NAME"
-    else
-        USE_FRIDA=0
-    fi
+        # Generate config for Frida Gadget
+        if [[ "$dylib" == *FridaGadget.dylib ]]; then
+            USE_FRIDA=1
+            generate_gadget_config "$DYLIB_NAME"
+        else
+            USE_FRIDA=0
+        fi
 
-    # Modify executable file
-    BINARY_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_DIR/Info.plist")
-    BINARY_PATH="$APP_DIR/$BINARY_NAME"
+        # Modify executable file
+        BINARY_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_DIR/Info.plist")
+        BINARY_PATH="$APP_DIR/$BINARY_NAME"
 
-    echo -e "${YELLOW}Injecting ${dylib} to ${APP_DIR}/Frameworks/${DYLIB_NAME}...${NC}"
-    insert_dylib --strip-codesig --all-yes --inplace "@executable_path/Frameworks/$DYLIB_NAME" "$BINARY_PATH"
-    INJECTED_DYLIBS+=("$DYLIB_NAME")
+        echo -e "${YELLOW}Injecting ${dylib} to ${APP_DIR}/Frameworks/${DYLIB_NAME}...${NC}"
+        insert_dylib --strip-codesig --all-yes --inplace "@executable_path/Frameworks/$DYLIB_NAME" "$BINARY_PATH"
+        INJECTED_DYLIBS+=("$DYLIB_NAME")
 
-done
+    done
 
-# Inject all frameworks in the current directory
-for framework in "${FRAMEWORKS[@]}"; do
-    FRAMEWORK_NAME=$(basename "$framework")
-    mkdir -p "$APP_DIR/Frameworks"
-    cp -r "$framework" "$APP_DIR/Frameworks/"
+    # Inject all frameworks in the current directory
+    for framework in "${FRAMEWORKS[@]}"; do
+        FRAMEWORK_NAME=$(basename "$framework")
+        mkdir -p "$APP_DIR/Frameworks"
+        cp -r "$framework" "$APP_DIR/Frameworks/"
 
-    # Assume dylib name is the same as framework name
-    DYLIB_IN_FRAMEWORK="${FRAMEWORK_NAME%.framework}"
-    DYLIB_FILE="$APP_DIR/Frameworks/$FRAMEWORK_NAME/$DYLIB_IN_FRAMEWORK"
-    if [ ! -f "$DYLIB_FILE" ]; then
-        die "Could not find dylib file in framework: $DYLIB_FILE"
-    fi
+        # Assume dylib name is the same as framework name
+        DYLIB_IN_FRAMEWORK="${FRAMEWORK_NAME%.framework}"
+        DYLIB_FILE="$APP_DIR/Frameworks/$FRAMEWORK_NAME/$DYLIB_IN_FRAMEWORK"
+        if [ ! -f "$DYLIB_FILE" ]; then
+            die "Could not find dylib file in framework: $DYLIB_FILE"
+        fi
 
-    # Modify install name
-    install_name_tool -id "@executable_path/Frameworks/$FRAMEWORK_NAME/$DYLIB_IN_FRAMEWORK" "$DYLIB_FILE"
-    DYLIB_PATH="@executable_path/Frameworks/$FRAMEWORK_NAME/$DYLIB_IN_FRAMEWORK"
+        # Modify install name
+        install_name_tool -id "@executable_path/Frameworks/$FRAMEWORK_NAME/$DYLIB_IN_FRAMEWORK" "$DYLIB_FILE"
+        DYLIB_PATH="@executable_path/Frameworks/$FRAMEWORK_NAME/$DYLIB_IN_FRAMEWORK"
 
-    echo -e "${YELLOW}Injecting framework ${framework} to ${APP_DIR}/Frameworks/${FRAMEWORK_NAME}...${NC}"
-    insert_dylib --strip-codesig --all-yes --inplace "$DYLIB_PATH" "$BINARY_PATH"
-    INJECTED_DYLIBS+=("$DYLIB_PATH")
-done
+        echo -e "${YELLOW}Injecting framework ${framework} to ${APP_DIR}/Frameworks/${FRAMEWORK_NAME}...${NC}"
+        insert_dylib --strip-codesig --all-yes --inplace "$DYLIB_PATH" "$BINARY_PATH"
+        INJECTED_DYLIBS+=("$DYLIB_PATH")
+    done
 
-echo -e "${YELLOW}Verifying injection results...${NC}"
+    echo -e "${YELLOW}Verifying injection results...${NC}"
 
-for dylib in "${INJECTED_DYLIBS[@]}"; do
+    for dylib in "${INJECTED_DYLIBS[@]}"; do
+        verify_injection "$BINARY_PATH" "$dylib"
+    done
 
-    verify_injection "$BINARY_PATH" "$dylib"
-done
-
-echo -e "${GREEN}Dylib ID check passed${NC}"
+    echo -e "${GREEN}Dylib ID check passed${NC}"
+else
+    echo -e "${GREEN}Sign-only mode: Skipping dylib injection...${NC}"
+fi
 
 # Clean old signatures
 clean_signatures
 
 # Sign all dylibs
-sign_dylibs "$APP_DIR"
+if [ $SIGN_ONLY -eq 0 ]; then
+    sign_dylibs "$APP_DIR"
+fi
 
 cd "$WORK_DIR"
-zip -qr "../tmp.ipa" Payload/
+ditto -c -k --sequesterRsrc --keepParent Payload "../tmp.ipa" || die "Failed to create IPA"
 cd ..
 
 # Use applesign for re-signing with the extracted Bundle ID
@@ -314,7 +341,7 @@ rm -rf ./Payload
 rm -rf "$WORK_DIR"
 
 # Save unpacked result for debugging
-unzip -q "$OUTPUT_IPA"
+ditto -x -k "$OUTPUT_IPA" . || die "Failed to extract final IPA"
 
 # Save path to the .app after unpacking
 APP_DIR="./Payload/$(basename "$APP_DIR")"
